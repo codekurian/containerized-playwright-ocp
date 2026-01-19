@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+dist
+.playwright
+test-results
+playwright-report
+*.md
+.git
+.gitignore
+.env
+.env.local
+build.sh
+run.sh
+docker-compose.yml

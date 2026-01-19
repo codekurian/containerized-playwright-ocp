@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  playwright:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: playwright-container:latest
+    container_name: playwright-runner
+    volumes:
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+      - ./playwright-report:/app/playwright-report
+    environment:
+      - NODE_ENV=production
+    # Uncomment if you need to run in headed mode (requires X11)
+    # network_mode: host
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+    # volumes:
+    #   - /tmp/.X11-unix:/tmp/.X11-unix
+    command: npm test
