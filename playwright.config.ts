@@ -33,6 +33,7 @@ export default defineConfig({
   },
 
   /* Configure projects for major browsers */
+  /* Only Chromium is configured - Firefox and WebKit are not installed */
   projects: [
     {
       name: 'chromium',
@@ -43,16 +44,6 @@ export default defineConfig({
         /* Ensure headless mode */
         headless: true,
       },
-    },
-
-    {
-      name: 'firefox',
-      use: { ...devices['Desktop Firefox'] },
-    },
-
-    {
-      name: 'webkit',
-      use: { ...devices['Desktop Safari'] },
     },
 
     /* Test against mobile viewports. */
