@@ -75,26 +75,64 @@ while IFS= read -r url || [ -n "$url" ]; do
     
     # Download the file
     # Try with SSL verification first (normal case in Docker)
-    curl -L -f -o "$output_file" -s "$url" 2>&1
+    # Don't use -f flag initially so we can capture HTTP codes even for errors
+    curl_output=$(curl -L -o "$output_file" -s -w "\n%{http_code}" "$url" 2>&1)
     curl_exit=$?
     
-    # If SSL certificate error (77) or connection errors, try with insecure flag
+    # Extract HTTP code from output (last line)
+    http_code_from_curl=$(echo "$curl_output" | tail -n 1 | tr -d '\n\r ')
+    
+    # Handle different curl exit codes
     if [ $curl_exit -ne 0 ]; then
-        if [ $curl_exit -eq 77 ] || [ $curl_exit -eq 6 ] || [ $curl_exit -eq 7 ] || [ $curl_exit -eq 22 ]; then
-            echo "  ⚠ Network/SSL issue (code $curl_exit), retrying with --insecure flag..."
-            curl -L -k -f -o "$output_file" -s "$url" 2>&1
-            curl_exit=$?
-        fi
+        case $curl_exit in
+            77)
+                # SSL certificate error - retry with insecure flag
+                echo "  ⚠ SSL certificate issue (code 77), retrying with --insecure flag..."
+                curl_output=$(curl -L -k -o "$output_file" -s -w "\n%{http_code}" "$url" 2>&1)
+                curl_exit=$?
+                http_code_from_curl=$(echo "$curl_output" | tail -n 1 | tr -d '\n\r ')
+                ;;
+            6|7)
+                # Connection errors - retry with insecure flag
+                echo "  ⚠ Network connection issue (code $curl_exit), retrying with --insecure flag..."
+                curl_output=$(curl -L -k -o "$output_file" -s -w "\n%{http_code}" "$url" 2>&1)
+                curl_exit=$?
+                http_code_from_curl=$(echo "$curl_output" | tail -n 1 | tr -d '\n\r ')
+                ;;
+            22)
+                # HTTP error (404, 403, etc.) - don't retry, just report
+                if [ -n "$http_code_from_curl" ] && [[ "$http_code_from_curl" =~ ^[0-9]{3}$ ]]; then
+                    echo "  ✗ HTTP error: $http_code_from_curl"
+                else
+                    # Try to get HTTP code via HEAD request
+                    http_code_from_curl=$(curl -L -I -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | tail -c 3)
+                    if [ -n "$http_code_from_curl" ] && [[ "$http_code_from_curl" =~ ^[0-9]{3}$ ]]; then
+                        echo "  ✗ HTTP error: $http_code_from_curl"
+                    else
+                        echo "  ✗ HTTP error (exit code 22)"
+                        http_code_from_curl="000"
+                    fi
+                fi
+                ;;
+            *)
+                echo "  ⚠ curl error (exit code $curl_exit)"
+                ;;
+        esac
     fi
     
-    # Get HTTP code separately for reporting (using HEAD request)
-    http_code=$(curl -L -I -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | tail -c 3)
-    if [ -z "$http_code" ] || ! [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
-        # If file was downloaded successfully, assume 200
-        if [ $curl_exit -eq 0 ] && [ -f "$output_file" ] && [ -s "$output_file" ]; then
-            http_code="200"
-        else
-            http_code="000"
+    # Use HTTP code from curl output if available, otherwise try HEAD request
+    if [ -n "$http_code_from_curl" ] && [[ "$http_code_from_curl" =~ ^[0-9]{3}$ ]]; then
+        http_code="$http_code_from_curl"
+    else
+        # Fallback: try HEAD request to get HTTP code
+        http_code=$(curl -L -I -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | tail -c 3)
+        if [ -z "$http_code" ] || ! [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
+            # If file was downloaded successfully, assume 200
+            if [ $curl_exit -eq 0 ] && [ -f "$output_file" ] && [ -s "$output_file" ]; then
+                http_code="200"
+            else
+                http_code="000"
+            fi
         fi
     fi
     
@@ -102,11 +140,40 @@ while IFS= read -r url || [ -n "$url" ]; do
     echo "  HTTP Status: $http_code"
     
     # Check if file was downloaded successfully (primary check)
+    # First check HTTP status code - if it's not 200, it's likely an error
+    if [ "$http_code" != "200" ] && [ "$http_code" != "000" ]; then
+        # Non-200 HTTP code - likely an error
+        if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+            # Check if it's an HTML error page
+            if head -1 "$output_file" 2>/dev/null | grep -q "<html\|<!DOCTYPE"; then
+                echo "  ✗ HTTP error $http_code: Server returned HTML error page"
+                rm -f "$output_file"
+                FAILED=$((FAILED + 1))
+                FAILED_LIST+=("$url (HTTP $http_code - HTML error page)")
+                continue
+            else
+                # Non-HTML file but non-200 status - might be a redirect or error
+                echo "  ✗ HTTP error $http_code: Unexpected response"
+                rm -f "$output_file"
+                FAILED=$((FAILED + 1))
+                FAILED_LIST+=("$url (HTTP $http_code)")
+                continue
+            fi
+        else
+            # No file created and non-200 status
+            echo "  ✗ HTTP error $http_code: File not found or access denied"
+            FAILED=$((FAILED + 1))
+            FAILED_LIST+=("$url (HTTP $http_code)")
+            continue
+        fi
+    fi
+    
+    # HTTP code is 200 or unknown (000) - check if file exists and is valid
     if [ -f "$output_file" ] && [ -s "$output_file" ]; then
         # File exists and has content - check if it's valid
         size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null || echo "0")
         
-        # Check if it's an HTML error page first
+        # Check if it's an HTML error page (even with 200 status, some servers return HTML)
         if head -1 "$output_file" 2>/dev/null | grep -q "<html\|<!DOCTYPE"; then
             echo "  ✗ Server returned HTML error page instead of RPM"
             rm -f "$output_file"
@@ -137,13 +204,36 @@ while IFS= read -r url || [ -n "$url" ]; do
             fi
         fi
     elif [ $curl_exit -ne 0 ]; then
-        # Curl failed and no file was created
-        echo "  ✗ WARNING: curl failed with exit code $curl_exit"
-        if [ -f "$output_file" ]; then
-            rm -f "$output_file"
+        # Curl failed - check if it's an HTTP error (exit code 22)
+        if [ $curl_exit -eq 22 ]; then
+            # HTTP error (404, 403, etc.) - file might contain error page
+            if [ -f "$output_file" ]; then
+                # Check if it's an HTML error page
+                if head -1 "$output_file" 2>/dev/null | grep -q "<html\|<!DOCTYPE"; then
+                    echo "  ✗ HTTP error $http_code: Server returned HTML error page"
+                    rm -f "$output_file"
+                    FAILED=$((FAILED + 1))
+                    FAILED_LIST+=("$url (HTTP $http_code - HTML error page)")
+                else
+                    # Non-HTML file but curl returned 22 - might be a redirect or other issue
+                    rm -f "$output_file"
+                    FAILED=$((FAILED + 1))
+                    FAILED_LIST+=("$url (HTTP $http_code - curl exit 22)")
+                fi
+            else
+                echo "  ✗ HTTP error $http_code: File not found or access denied"
+                FAILED=$((FAILED + 1))
+                FAILED_LIST+=("$url (HTTP $http_code)")
+            fi
+        else
+            # Other curl errors
+            echo "  ✗ WARNING: curl failed with exit code $curl_exit"
+            if [ -f "$output_file" ]; then
+                rm -f "$output_file"
+            fi
+            FAILED=$((FAILED + 1))
+            FAILED_LIST+=("$url (curl error $curl_exit)")
         fi
-        FAILED=$((FAILED + 1))
-        FAILED_LIST+=("$url (curl error $curl_exit)")
     elif [ -f "$output_file" ] && [ ! -s "$output_file" ]; then
         # File exists but is empty
         echo "  ✗ WARNING: File is empty"
