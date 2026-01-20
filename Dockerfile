@@ -155,6 +155,9 @@ RUN mkdir -p /opt/playwright-chromium && \
 # Copy application files
 COPY . .
 
+# Make download scripts executable
+RUN chmod +x download-rpms.sh 2>/dev/null || echo "download-rpms.sh not found, will be available after COPY"
+
 # Set environment variables
 ENV NODE_ENV=production
 # Set Chromium executable path for Playwright (headless mode)
